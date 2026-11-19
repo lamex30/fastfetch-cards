@@ -53,14 +53,8 @@ The package count supports portage, pacman, dpkg, apk, xbps and rpm. The OS icon
 ### jellyfish
 ![jellyfish](screenshots/jellyfish.png)
 
-### lx
-![lx](screenshots/lx.png)
-
 ### saturn
 ![saturn](screenshots/saturn.png)
-
-### smiley
-![smiley](screenshots/smiley.png)
 
 ## Screenshots
 
