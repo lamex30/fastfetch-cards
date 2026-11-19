@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+import os
+import re
+import pwd
+import time
+import glob
+import shutil
+import sys
+import socket
+import platform
+import subprocess
+import unicodedata
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "fastfetch")
+ART_DIR = os.environ.get("FASTFETCH_CARDS_ART_DIR") or os.path.join(CONFIG_DIR, "art")
+
+def real_fastfetch():
+    """The real fastfetch binary further down PATH (this script shadows it)."""
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d or ".", "fastfetch")
+        if os.access(cand, os.X_OK) and os.path.realpath(cand) != me:
+            return cand
+    return None
+
+def exec_real(args):
+    real = real_fastfetch()
+    if not real:
+        sys.exit("fastfetch-cards: real fastfetch not found in PATH (needed for: %s)" % " ".join(args))
+    os.execv(real, [real] + args)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def vlen(s):
+    return sum(char_width(c) for c in ANSI_RE.sub("", s))
+
+def char_width(char):
+    if unicodedata.combining(char) or unicodedata.category(char) in ("Cc", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+def pad_right(s, width):
+    diff = width - vlen(s)
+    return s + (" " * max(0, diff))
+
+def trunc_vis(s, max_len):
+    if vlen(s) <= max_len:
+        return s
+    if max_len <= 0:
+        return ""
+    result, width, pos = [], 0, 0
+    while pos < len(s):
+        escape = ANSI_RE.match(s, pos)
+        if escape:
+            result.append(escape.group())
+            pos = escape.end()
+            continue
+        step = char_width(s[pos])
+        if width + step > max_len - 1:
+            break
+        result.append(s[pos])
+        width += step
+        pos += 1
+    return "".join(result) + "…\033[0m"
+
+# ANSI colors come from the terminal palette and follow wallpaper changes.
+C_RESET  = "\033[0m"
+C_BORDER = "\033[90m"
+C_TITLE  = "\033[36m"
+C_ICON   = "\033[36m"
+C_TEXT   = "\033[39m"
+C_DIM    = "\033[90m"
+C_USER   = "\033[36m"
+C_HOST   = "\033[39m"
+
+# Nerd Font glyphs per /etc/os-release ID; Tux for everything else.
+OS_ICONS = {"arch": "\uf303", "debian": "\uf306", "ubuntu": "\uf31b", "fedora": "\uf30a",
+            "void": "\uf32e", "nixos": "\uf313", "opensuse": "\uf314", "manjaro": "\uf312",
+            "linuxmint": "\uf30e", "alpine": "\uf300", "endeavouros": "\uf322"}
+
+def get_os_icon():
+    if os.environ.get("FASTFETCH_CARDS_OS_ICON"):
+        return os.environ["FASTFETCH_CARDS_OS_ICON"]
+    try:
+        for line in open("/etc/os-release"):
+            if line.startswith("ID="):
+                os_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return OS_ICONS.get(os_id, OS_ICONS.get(os_id.split("-")[0], "\uf31a"))
+    except Exception:
+        pass
+    return "\uf31a"
+
+def get_os_name():
+    fields = {}
+    try:
+        for line in open("/etc/os-release"):
+            if "=" in line:
+                k, v = line.rstrip("\n").split("=", 1)
+                fields[k] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return fields.get("PRETTY_NAME") or fields.get("NAME") or platform.system()
+
+def get_wm():
+    """Real compositor name: the running Wayland compositor process, else XDG_CURRENT_DESKTOP."""
+    known = ("mango", "sway", "Hyprland", "niri", "river", "labwc", "wayfire", "kwin_wayland",
+             "gnome-shell", "dwl", "Xwayland")
+    try:
+        names = {open(f"/proc/{pid}/comm").read().strip() for pid in os.listdir("/proc") if pid.isdigit()}
+    except Exception:
+        names = set()
+    for k in known[:-1]:
+        if k in names:
+            return k
+    return os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION") or "unknown"
+
+def get_pkgs():
+    total = 0
+    for pattern in ("/var/db/pkg/*/*", "/var/lib/pacman/local/*/"):  # portage, pacman
+        total += len(glob.glob(pattern))
+    try:  # dpkg
+        total += sum(1 for l in open("/var/lib/dpkg/status") if l.startswith("Status:") and " installed" in l)
+    except Exception:
+        pass
+    try:  # apk
+        total += sum(1 for l in open("/lib/apk/db/installed") if l.startswith("P:"))
+    except Exception:
+        pass
+    if total == 0:
+        for cmd in (["xbps-query", "-l"], ["rpm", "-qa"]):
+            if shutil.which(cmd[0]):
+                try:
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
+                    if res.returncode == 0:
+                        total = len(res.stdout.splitlines())
+                        break
+                except Exception:
+                    pass
+    return str(total) if total else "?"
+
+def get_cpu():
+    try:
+        for line in open("/proc/cpuinfo"):
+            if "model name" in line:
+                name = line.split(":", 1)[1].strip()
+                # Компактное имя как на скрине (например i5-8250U или Ryzen 5 5600X)
+                m = re.search(r"(i[3579]-[0-9A-Za-z]+|Ryzen \d+ \w+|N\d+|Celeron \w+|Pentium \w+)", name)
+                if m:
+                    return m.group(1)
+                name = re.sub(r"\(R\)|\(TM\)|CPU|Processor|@.*|Intel|AMD|Core", "", name).strip()
+                return re.sub(r"\s+", " ", name)
+    except Exception:
+        pass
+    return platform.processor() or "x86_64"
+
+def get_gpu():
+    try:
+        res = subprocess.run(["lspci"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=1.5)
+        for line in res.stdout.splitlines():
+            if "VGA" in line or "3D" in line or "Display" in line:
+                part = line.split(":", 2)[-1].strip()
+                m = re.search(r"\[([^\]]+)\]", part)
+                if m:
+                    g = m.group(1)
+                else:
+                    g = part
+                g = re.sub(r"Corporation|Advanced Micro Devices, Inc\.|NVIDIA|Intel|Integrated|Graphics Controller|Series", "", g).strip()
+                g = re.sub(r"\s+", " ", g)
+                if g:
+                    return trunc_vis(g, 20)
+    except Exception:
+        pass
+    return "Integrated GPU"
+
+def get_mem():
+    try:
+        info = {}
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":", 1)
+            info[k.strip()] = int(v.strip().split()[0])
+        total_gib = info["MemTotal"] / (1024 * 1024)
+        avail_gib = info.get("MemAvailable", info.get("MemFree", 0)) / (1024 * 1024)
+        used_gib = max(0.1, total_gib - avail_gib)
+        return used_gib, total_gib
+    except Exception:
+        return 0.0, 0.0
+
+def get_disk():
+    try:
+        st = os.statvfs("/")
+        total = (st.f_blocks * st.f_frsize) / (1024**3)
+        free = (st.f_bavail * st.f_frsize) / (1024**3)
+        used = total - free
+        return int(round(used)), int(round(total))
+    except Exception:
+        return 0, 0
+
+def get_uptime():
+    try:
+        sec = int(float(open("/proc/uptime").read().split()[0]))
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        if h > 0:
+            return f"{h}h {m}m"
+        return f"{m}m"
+    except Exception:
+        return "?"
+
+def get_os_age():
+    try:
+        st = os.stat("/")
+        birth = getattr(st, "st_birthtime", 0) or st.st_ctime
+        diff = max(0, int(time.time() - birth))
+        d = diff // 86400
+        h = (diff % 86400) // 3600
+        return f"{d}d {h}h"
+    except Exception:
+        return "?"
+
+def make_bar(ratio, width=10):
+    filled = max(1, min(width, int(round(ratio * width))))
+    empty = width - filled
+    return f"{C_TITLE}{'━' * filled}{C_BORDER}{'─' * empty}{C_RESET}"
+
+def make_box(title, rows, inner_w, max_width=None):
+    # Создаёт карточку с рамкой и заголовком как на скрине 4
+    inner_w = max(inner_w, max((vlen(r) for r in rows), default=0), vlen(title) + 2)
+    if max_width is not None:
+        inner_w = min(inner_w, max(0, max_width - 4))
+    title = trunc_vis(title, max(0, inner_w - 2))
+    top_dash = max(0, inner_w - vlen(title) - 1)
+    top = f"{C_BORDER}╭─ {C_TITLE}{title}{C_BORDER} {'─' * top_dash}╮{C_RESET}"
+    bot = f"{C_BORDER}╰{'─' * (inner_w + 2)}╯{C_RESET}"
+    body = []
+    for r in rows:
+        body.append(f"{C_BORDER}│{C_RESET} {pad_right(trunc_vis(r, inner_w), inner_w)} {C_BORDER}│{C_RESET}")
+    return [top] + body + [bot]
+
+def terminal_size():
+    # Read the current PTY size, even when inherited COLUMNS/LINES are stale.
+    try:
+        return os.get_terminal_size(sys.stdout.fileno())
+    except (OSError, ValueError):
+        return shutil.get_terminal_size(fallback=(80, 24))
+
+def join_boxes(boxes):
+    return [" ".join(box[i] for box in boxes) for i in range(len(boxes[0]))]
+
+def wrap_boxes(boxes, columns):
+    lines, row, width = [], [], 0
+    for box in boxes:
+        box_width = max(map(vlen, box))
+        if row and width + 1 + box_width > columns:
+            lines.extend(join_boxes(row))
+            lines.append("")
+            row, width = [], 0
+        width += (1 if row else 0) + box_width
+        row.append(box)
+    if row:
+        lines.extend(join_boxes(row))
+    return lines
+
+def main():
+    import random
+    size = terminal_size()
+    columns = max(1, size.columns)
+    args = sys.argv[1:]
+    art_dir = ART_DIR
+    available_arts = sorted([os.path.splitext(f)[0] for f in os.listdir(art_dir) if f.endswith(".txt")]) if os.path.isdir(art_dir) else []
+
+    chosen_art_name = None
+    if args:
+        if args[0] in ("-l", "--logo", "-a", "--art") and len(args) >= 2:
+            req = args[1].lower()
+            if req in available_arts:
+                chosen_art_name = req
+            else:
+                # Если запрошен стандартный системный логотип (например -l arch), передаём реальному fastfetch
+                exec_real(args)
+        elif args[0] in ("--list-arts", "--arts", "-la"):
+            print("✦ Available arts:", ", ".join(available_arts))
+            print("  One-off: fastfetch -a <name>  (or fastfetch -l <name>)")
+            return
+        elif len(args) == 1 and args[0].lstrip("-").lower() in available_arts:
+            chosen_art_name = args[0].lstrip("-").lower()
+        else:
+            exec_real(args)
+
+    # Если арт не указан явно — выбираем случайный (без повтора предыдущего!)
+    cache_dir = os.path.join(HOME, ".cache", "fastfetch")
+    os.makedirs(cache_dir, exist_ok=True)
+    last_art_file = os.path.join(cache_dir, "last-art")
+    if not chosen_art_name and available_arts:
+        last_used = ""
+        if os.path.exists(last_art_file):
+            try:
+                last_used = open(last_art_file).read().strip()
+            except Exception:
+                pass
+        pool = [a for a in available_arts if a != last_used] or available_arts
+        chosen_art_name = random.choice(pool)
+        try:
+            with open(last_art_file, "w") as lf:
+                lf.write(chosen_art_name)
+        except Exception:
+            pass
+
+    user = pwd.getpwuid(os.getuid()).pw_name
+    host = socket.gethostname()
+    now_str = time.strftime("%a · %d.%m.%y · %I:%M %p").lower()
+
+    os_name = trunc_vis(get_os_name(), 17)
+    kernel = trunc_vis(platform.release(), 13)
+    wm = get_wm()
+    shell = os.path.basename(pwd.getpwuid(os.getuid()).pw_shell or os.environ.get("SHELL", "sh"))
+    pkgs = get_pkgs()
+
+    cpu_name = trunc_vis(get_cpu(), 23)
+    gpu_name = trunc_vis(get_gpu(), 23)
+    mem_u, mem_t = get_mem()
+    disk_u, disk_t = get_disk()
+
+    mem_bar = make_bar(mem_u / max(0.1, mem_t), 9)
+    disk_bar = make_bar(disk_u / max(1, disk_t), 9)
+
+    # Карточка 1: system (5 строк внутри)
+    sys_rows = [
+        f"{C_ICON}{get_os_icon()} {C_TEXT} {os_name}{C_RESET}",
+        f"{C_ICON} {C_TEXT} {kernel}{C_RESET}",
+        f"{C_ICON} {C_TEXT} {wm}{C_RESET}",
+        f"{C_ICON} {C_TEXT} {shell}{C_RESET}",
+        f"{C_ICON}󰏖 {C_TEXT} {pkgs} {C_DIM}pkgs{C_RESET}",
+    ]
+    box_sys = make_box("system", sys_rows, 17, columns)
+
+    # Карточка 2: hardware (5 строк внутри)
+    mem_str = f"{C_TEXT}{mem_u:.1f}{C_DIM}/{mem_t:.1f} GiB{C_RESET}"
+    disk_str = f"{C_TEXT}{disk_u}{C_DIM}/{disk_t} GiB{C_RESET}"
+    hw_rows = [
+        f"{C_ICON} {C_TEXT} {cpu_name}{C_RESET}",
+        f"{C_ICON}󰢮 {C_TEXT} {gpu_name}{C_RESET}",
+        f"{C_ICON}󰍛 {C_RESET} {mem_bar} {mem_str}",
+        f"{C_ICON}󰋊 {C_RESET} {disk_bar} {disk_str}",
+        "",
+    ]
+    box_hw = make_box("hardware", hw_rows, 26, columns)
+
+    # Карточка 3: time (5 строк внутри, включая цветные точки палитры)
+    dots = (
+        "\033[31m● "
+        "\033[32m● "
+        "\033[33m● "
+        "\033[34m● "
+        "\033[35m● "
+        "\033[36m●\033[0m"
+    )
+    time_rows = [
+        f"{C_DIM} {C_TEXT} {get_uptime()}{C_RESET}",
+        f"{C_DIM} {C_TEXT} {get_os_age()}{C_RESET}",
+        "",
+        f" {dots}",
+        "",
+    ]
+    box_time = make_box("time", time_rows, 13, columns)
+
+    # Склеиваем 3 карточки горизонтально в ряд!
+    boxes = [box_sys, box_hw, box_time]
+    cards_lines = join_boxes(boxes)
+
+    # Заголовок без надписи DRIFT (только юзер@хост и дата/время как просил)
+    right_lines = [
+        "",
+        f"  {C_USER}{user}{C_DIM}@{C_HOST}{host}{C_RESET}",
+        f"  {C_DIM}{now_str}{C_RESET}",
+        "",
+    ] + cards_lines
+
+    # Читаем объёмный 3D ASCII-арт
+    art_file = os.path.join(art_dir, f"{chosen_art_name}.txt") if chosen_art_name else os.path.join(CONFIG_DIR, "ascii.txt")
+    if os.path.exists(art_file):
+        art_lines = [line.rstrip("\n") for line in open(art_file)]
+    else:
+        art_lines = [""]
+
+    art_w = max((vlen(line) for line in art_lines), default=0)
+    info_w = max(map(vlen, right_lines), default=0)
+    show_logo = (
+        art_w > 0
+        and art_w + 3 + info_w <= columns
+        and max(len(art_lines), len(right_lines)) + 2 <= size.lines
+    )
+
+    if not show_logo:
+        # Keep the information legible when even the cards cannot fit in one row.
+        right_lines = right_lines[:4] + wrap_boxes(boxes, columns)
+        print()
+        for line in right_lines:
+            print(trunc_vis(line, columns))
+        print()
+        return
+
+    total_lines = max(len(art_lines), len(right_lines))
+
+    print()
+    for i in range(total_lines):
+        left_part = art_lines[i] if i < len(art_lines) else ""
+        right_part = right_lines[i] if i < len(right_lines) else ""
+        print(f" {pad_right(left_part, art_w)}  {right_part}")
+    print()
+
+if __name__ == "__main__":
+    main()
